@@ -20,11 +20,13 @@ func main() {
 		dir      string
 		threads  int
 		interval int
+		shuffle  bool
 	)
 	flag.StringVar(&listFile, "file", "", "list file")
 	flag.StringVar(&dir, "basedir", "", "base directory")
 	flag.IntVar(&threads, "threads", runtime.NumCPU(), "threads count")
 	flag.IntVar(&interval, "interval", 0, "process lag in ms")
+	flag.BoolVar(&shuffle, "shuffle", false, "shuffle reading order")
 	flag.Parse()
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -53,6 +55,7 @@ type Reader struct {
 	lastReadBytes int64
 	readCount     int64
 	lastReadCount int64
+	failedCount   int64
 	interval      time.Duration
 
 	once sync.Once
@@ -86,6 +89,7 @@ func (s Size) String() string {
 
 func (r *Reader) read(pathC <-chan []byte, wg *sync.WaitGroup) {
 	defer wg.Done()
+	finished := make(chan int, 1)
 	r.once.Do(func() {
 		if r.dir != "" {
 			if err := os.Chdir(r.dir); err != nil {
@@ -95,16 +99,35 @@ func (r *Reader) read(pathC <-chan []byte, wg *sync.WaitGroup) {
 		go func() {
 			ticker := time.NewTicker(time.Second)
 			var counter int
-			for range ticker.C {
-				counter++
-				lastBytes := atomic.LoadInt64(&r.lastReadBytes)
-				currBytes := atomic.LoadInt64(&r.readBytes)
-				lastReadCount := atomic.LoadInt64(&r.lastReadCount)
-				currReadCount := atomic.LoadInt64(&r.readCount)
-				atomic.StoreInt64(&r.lastReadBytes, currBytes)
-				atomic.StoreInt64(&r.lastReadCount, currReadCount)
-				fmt.Printf("%06d throughput: [%13s / %13s] iops: [%7d / %7d]\n",
-					counter, Size(float64(currBytes)/float64(counter)), Size(currBytes-lastBytes), int64(float64(currReadCount)/float64(counter)), currReadCount-lastReadCount)
+			for {
+				select {
+				case <-finished:
+					lastBytes := atomic.LoadInt64(&r.lastReadBytes)
+					currBytes := atomic.LoadInt64(&r.readBytes)
+					lastReadCount := atomic.LoadInt64(&r.lastReadCount)
+					currReadCount := atomic.LoadInt64(&r.readCount)
+					atomic.StoreInt64(&r.lastReadBytes, currBytes)
+					atomic.StoreInt64(&r.lastReadCount, currReadCount)
+					fmt.Printf("%6s throughput: [%13s / %13s] iops: [%7d / %7d] failed: %-d\n",
+						"SUM",
+						Size(float64(currBytes)/float64(counter)), Size(currBytes-lastBytes),
+						int64(float64(currReadCount)/float64(counter)), currReadCount-lastReadCount,
+						r.failedCount)
+					return
+				case <-ticker.C:
+					counter++
+					lastBytes := atomic.LoadInt64(&r.lastReadBytes)
+					currBytes := atomic.LoadInt64(&r.readBytes)
+					lastReadCount := atomic.LoadInt64(&r.lastReadCount)
+					currReadCount := atomic.LoadInt64(&r.readCount)
+					atomic.StoreInt64(&r.lastReadBytes, currBytes)
+					atomic.StoreInt64(&r.lastReadCount, currReadCount)
+					fmt.Printf("%06d throughput: [%13s / %13s] iops: [%7d / %7d] failed: %-d\n",
+						counter,
+						Size(float64(currBytes)/float64(counter)), Size(currBytes-lastBytes),
+						int64(float64(currReadCount)/float64(counter)), currReadCount-lastReadCount,
+						r.failedCount)
+				}
 			}
 		}()
 	})
@@ -113,6 +136,7 @@ func (r *Reader) read(pathC <-chan []byte, wg *sync.WaitGroup) {
 		n, err := ioutil.ReadFile(string(p))
 		if err != nil {
 			// fmt.Println(fmt.Sprintf("path: %s  error: %v\n", p, err))
+			atomic.AddInt64(&r.failedCount, 1)
 			continue
 		}
 		atomic.AddInt64(&r.readBytes, int64(len(n)))
@@ -121,6 +145,7 @@ func (r *Reader) read(pathC <-chan []byte, wg *sync.WaitGroup) {
 			time.Sleep(r.interval * time.Millisecond)
 		}
 	}
+	close(finished)
 }
 
 func readRequest(reader io.Reader) <-chan []byte {
